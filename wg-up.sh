@@ -1,31 +1,44 @@
-#!/bin/bash
-CONFIG_NAME="$1"
-DEV_NAME="wg-$CONFIG_NAME"
-source ${BASH_SOURCE%/*}/ext/$CONFIG_NAME.conf
+#!/usr/bin/env bash
+set -x
+set -euo pipefail
 
-ip netns add $CONFIG_NAME
-ip netns exec $CONFIG_NAME ip link set lo up
-ip link add dev $DEV_NAME type wireguard
-wg setconf $DEV_NAME /etc/wireguard/$CONFIG_NAME.conf
-ip link set $DEV_NAME netns $CONFIG_NAME up
-addrs=$(grep -oP "#Address = \K(.*)" /etc/wireguard/$CONFIG_NAME.conf)
+CONF_IN="${1}"
+WGDEV="wg0"
+NETNS="$(basename "${CONF_IN}" ".conf")"
+
+CONF="$(mktemp)"
+cp "${CONF_IN}" "${CONF}"
+
+sed -i 's/^Address/#Address/g' "${CONF}"
+sed -i 's/^DNS/#DNS/g' "${CONF}"
+
+sudo rm -rf "/etc/netns/${NETNS}"
+sudo mkdir -p "/etc/netns/${NETNS}"
+
+sudo ip netns del "${NETNS}" || true
+sudo ip netns add "${NETNS}"
+sudo ip netns exec "${NETNS}" ip link set lo up
+
+sudo ip link del dev "${WGDEV}" || true
+sudo ip link add dev "${WGDEV}" type wireguard
+
+sudo wg setconf "${WGDEV}" "${CONF}"
+sudo ip link set "${WGDEV}" netns "${NETNS}" up
+
+# handle DNS=
+dns=$(grep -oP "#DNS = \K(.*)" "${CONF}")
+echo "nameserver $dns" | sudo tee "/etc/netns/${NETNS}/resolv.conf"
+
+# handle Address=
+addrs=$(grep -oP "#Address = \K(.*)" "${CONF}")
 IFS=", "; for addr in $addrs; do
   if [[ $addr = *":"* ]]; then
-    # IPv6
-    ip netns exec $CONFIG_NAME ip -6 addr add $addr dev $DEV_NAME
+    sudo ip netns exec "${NETNS}" ip -6 addr add $addr dev "${WGDEV}"
   else
-    # IPv4
-    ip netns exec $CONFIG_NAME ip addr add $addr dev $DEV_NAME
+    sudo ip netns exec "${NETNS}" ip addr add $addr dev "${WGDEV}"
   fi
 done
 
-if $PRIVATE_VETH_ENABLED; then
-  ip link add dev "$CONFIG_NAME"0 type veth peer name "$CONFIG_NAME"1
-  ip link set "$CONFIG_NAME"0 up
-  ip link set "$CONFIG_NAME"1 netns $CONFIG_NAME up
-  ip addr add $PRIVATE_ADDRESS_HOST dev "$CONFIG_NAME"0
-  ip netns exec $CONFIG_NAME ip addr add $PRIVATE_ADDRESS_CLIENT dev "$CONFIG_NAME"1
-fi
-ip netns exec $CONFIG_NAME ip route add default dev $DEV_NAME
-ip netns exec $CONFIG_NAME ip -6 route add default dev $DEV_NAME
+sudo ip netns exec "${NETNS}" ip route add default dev "${WGDEV}"
+sudo ip netns exec "${NETNS}" ip -6 route add default dev "${WGDEV}"
 
